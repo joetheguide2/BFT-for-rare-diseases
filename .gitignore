@@ -5,6 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
-
+checkpoints
+checkpoints_*
+unsloth_compiled_cache
 # Virtual environments
 .venv
+pure_sft_small

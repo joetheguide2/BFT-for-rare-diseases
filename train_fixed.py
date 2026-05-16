@@ -17,10 +17,10 @@ max_seq_length = 4096
 lora_rank = 128
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/Qwen2.5-1.5B-Instruct",
+    model_name="unsloth/Qwen2.5-0.5B-Instruct",
     # unsloth/gemma-3-1b-it
     max_seq_length=max_seq_length,
-    load_in_4bit=True,
+    load_in_4bit=False,
     fast_inference=False,
     max_lora_rank=lora_rank,
 )
@@ -81,7 +81,7 @@ trainer = SFTTrainer(
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         warmup_ratio=0.05,
-        num_train_epochs=20,
+        num_train_epochs=30,
         learning_rate=2e-4,
         logging_steps=1,
         optim="paged_adamw_8bit",
@@ -119,8 +119,8 @@ trainer.train(resume_from_checkpoint=False)
 # plt.savefig('loss_curve.png', dpi=300, bbox_inches='tight')
 # plt.show()
 
-model.save_pretrained("finetuned_1.5_full_16")
-tokenizer.save_pretrained("finetuned_1.5_full_16")
+model.save_pretrained("pure_sft_small")
+tokenizer.save_pretrained("pure_sft_small")
 
 gc.collect()
 torch.cuda.empty_cache()

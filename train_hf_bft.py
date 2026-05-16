@@ -1,9 +1,8 @@
 import os
 
-os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-import unsloth
 import numpy as np
 import pandas as pd
 import gc
@@ -11,15 +10,29 @@ import torch
 import torch.nn.functional as F
 import json
 from datasets import Dataset
-from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForSeq2Seq,
+)
+from peft import get_peft_model, LoraConfig, TaskType
 
-max_seq_length = 4096
-lora_rank = 128
 
 # ─────────────────────────────────────────────
-#  BFT loss components
+#  Config
+# ─────────────────────────────────────────────
+
+MODEL_NAME = "unsloth/Qwen2.5-0.5B-Instruct"
+MAX_SEQ_LENGTH = 4096  # safe for 5.67GB VRAM without 4-bit
+LORA_RANK = 128  # sufficient for 0.5B domain adaptation
+LORA_ALPHA = 256
+OUTPUT_DIR = "./checkpoints_bft"
+SAVE_DIR = "./finetuned_0.5b_bft"
+
+# ─────────────────────────────────────────────
+#  BFT loss
 # ─────────────────────────────────────────────
 
 
@@ -89,6 +102,7 @@ def compute_token_weights(conf, mask, g=256, eps=1e-8):
     mean_conf = conf.mean(-1, keepdim=True).clamp(min=eps)
     suppressed = conf / mean_conf
     w_a = is_high + suppressed * is_low
+
     w = torch.ones_like(conf)
     w = w * (1 - group_a) + w_a * group_a
     w = w * mask.float()
@@ -102,6 +116,7 @@ def compute_sample_weights(conf, mask, g=256, s_min=0.5, s_max=2.0, eps=1e-8):
     pad_len = g - 1
     conf_pad = F.pad(conf * mask.float(), (0, pad_len))
     mask_pad = F.pad(mask.float(), (0, pad_len))
+
     conf_windows = conf_pad.unfold(-1, g, 1)
     mask_windows = mask_pad.unfold(-1, g, 1)
 
@@ -140,11 +155,11 @@ def bft_loss(logits, labels, g=256, s_min=0.5, s_max=2.0):
 
 
 # ─────────────────────────────────────────────
-#  BFT Trainer
+#  BFT Trainer — pure HF, zero Unsloth
 # ─────────────────────────────────────────────
 
 
-class BFTTrainer(SFTTrainer):
+class BFTTrainer(Trainer):
     def __init__(
         self, *args, bft_window_size=256, bft_s_min=0.5, bft_s_max=2.0, **kwargs
     ):
@@ -158,7 +173,7 @@ class BFTTrainer(SFTTrainer):
     ):
         labels = inputs.get("labels")
         outputs = model(**inputs)
-        logits = outputs.logits
+        logits = outputs.logits  # real tensor, no patches
 
         loss = bft_loss(
             logits, labels, g=self.bft_g, s_min=self.bft_s_min, s_max=self.bft_s_max
@@ -167,20 +182,26 @@ class BFTTrainer(SFTTrainer):
 
 
 # ─────────────────────────────────────────────
-#  Model + tokeniser
+#  Model + tokeniser — pure HF + PEFT
 # ─────────────────────────────────────────────
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/Qwen2.5-0.5B-Instruct",
-    max_seq_length=max_seq_length,
-    load_in_4bit=False,
-    fast_inference=False,
-    max_lora_rank=lora_rank,
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.model_max_length = MAX_SEQ_LENGTH
+tokenizer.padding_side = "right"
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
 )
-tokenizer.model_max_length = max_seq_length
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=lora_rank,
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=LORA_RANK,
+    lora_alpha=LORA_ALPHA,
     target_modules=[
         "q_proj",
         "k_proj",
@@ -190,10 +211,11 @@ model = FastLanguageModel.get_peft_model(
         "up_proj",
         "down_proj",
     ],
-    lora_alpha=lora_rank * 2,
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
+    lora_dropout=0.05,
+    bias="none",
 )
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
 # ─────────────────────────────────────────────
 #  Dataset
@@ -201,23 +223,34 @@ model = FastLanguageModel.get_peft_model(
 
 df = pd.read_csv("./rare_diseases_what_is_only.csv")
 df["messages"] = df["messages"].apply(json.loads)
-tokenizer = get_chat_template(tokenizer, chat_template="qwen2.5")
 
 ds = df.copy()
 ds["text"] = None
 for i in range(len(ds)):
-    messages = ds.loc[i, "messages"]
-    ds.loc[i, "text"] = tokenizer.apply_chat_template(messages, tokenize=False)
+    # apply_chat_template works directly on the tokenizer
+    ds.loc[i, "text"] = tokenizer.apply_chat_template(
+        ds.loc[i, "messages"],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 ds = Dataset.from_pandas(ds[["text"]])
 
 
-def check_lengths(example):
-    tokens = tokenizer(example["text"], truncation=True, max_length=max_seq_length)
-    return len(tokens["input_ids"])
+def tokenize(example):
+    result = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=MAX_SEQ_LENGTH,
+        padding=False,
+    )
+    result["labels"] = result["input_ids"].copy()
+    return result
 
 
-lengths = ds.map(lambda x: {"length": check_lengths(x)})
-print(f"Max token length after forced truncation: {max(lengths['length'])}")
+tokenized_ds = ds.map(tokenize, remove_columns=["text"], num_proc=4)
+lengths = [len(x) for x in tokenized_ds["input_ids"]]
+print(f"Max token length: {max(lengths)}")
+print(f"Mean token length: {sum(lengths) / len(lengths):.0f}")
 
 gc.collect()
 torch.cuda.empty_cache()
@@ -226,41 +259,52 @@ torch.cuda.empty_cache()
 #  Train
 # ─────────────────────────────────────────────
 
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,  # conservative for 5.67GB
+    gradient_accumulation_steps=16,  # effective batch = 16, same as before
+    warmup_ratio=0.05,
+    num_train_epochs=30,
+    learning_rate=2e-4,
+    logging_steps=1,
+    optim="paged_adamw_8bit",
+    weight_decay=0.001,
+    lr_scheduler_type="cosine",
+    seed=3407,
+    bf16=True,
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+    save_strategy="steps",
+    save_steps=50,
+    save_total_limit=2,
+    report_to="none",
+    dataloader_pin_memory=False,
+    dataloader_num_workers=0,
+)
+
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer,
+    model=model,
+    padding=True,
+    pad_to_multiple_of=8,
+    label_pad_token_id=-100,
+)
+
 trainer = BFTTrainer(
     model=model,
-    tokenizer=tokenizer,
-    train_dataset=ds,
+    args=training_args,
+    train_dataset=tokenized_ds,
+    data_collator=data_collator,
     bft_window_size=256,
     bft_s_min=0.5,
     bft_s_max=2.0,
-    args=SFTConfig(
-        output_dir="./checkpoints_bft",
-        max_seq_length=max_seq_length,
-        dataset_text_field="text",
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        warmup_ratio=0.05,
-        num_train_epochs=30,
-        learning_rate=2e-4,
-        logging_steps=1,
-        optim="paged_adamw_8bit",
-        weight_decay=0.001,
-        lr_scheduler_type="cosine",
-        seed=3407,
-        packing=False,
-        gradient_checkpointing="unsloth",
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=2,
-        logging_dir="./runs_bft",
-    ),
 )
-
 
 trainer.train(resume_from_checkpoint=False)
 
-model.save_pretrained("finetuned_0.5_bft")
-tokenizer.save_pretrained("finetuned_0.5_bft")
+model.save_pretrained(SAVE_DIR)
+tokenizer.save_pretrained(SAVE_DIR)
+print(f"Saved to {SAVE_DIR}")
 
 gc.collect()
 torch.cuda.empty_cache()

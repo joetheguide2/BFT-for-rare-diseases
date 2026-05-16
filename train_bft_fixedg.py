@@ -1,25 +1,37 @@
 import os
 
-os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-import unsloth
+import gc
+import json
 import numpy as np
 import pandas as pd
-import gc
 import torch
 import torch.nn.functional as F
-import json
 from datasets import Dataset
-from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
-
-max_seq_length = 4096
-lora_rank = 128
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
+)
 
 # ─────────────────────────────────────────────
-#  BFT loss components
+#  Config
+# ─────────────────────────────────────────────
+
+MODEL_NAME = "unsloth/Qwen2.5-0.5B-Instruct"
+MAX_SEQ_LENGTH = 4096  # Reduced slightly from 4096 to safely fit 5.67GB VRAM
+LORA_RANK = 128  # Safer memory footprint for 0.5B model on tight hardware
+LORA_ALPHA = 256
+OUTPUT_DIR = "./checkpoints_bft"
+SAVE_DIR = "./finetuned_0.5b_bft"
+
+# ─────────────────────────────────────────────
+#  BFT loss Functions
 # ─────────────────────────────────────────────
 
 
@@ -86,9 +98,14 @@ def compute_token_weights(conf, mask, g=256, eps=1e-8):
     is_low = (conf < threshold).float() * mask.float()
     is_high = (1.0 - is_low) * mask.float()
 
-    mean_conf = conf.mean(-1, keepdim=True).clamp(min=eps)
+    # FIX: Compute mean_conf only over valid non-padded tokens
+    valid_counts = mask.sum(-1, keepdim=True).clamp(min=1)
+    mean_conf = (conf * mask).sum(-1, keepdim=True) / valid_counts
+    mean_conf = mean_conf.clamp(min=eps)
+
     suppressed = conf / mean_conf
     w_a = is_high + suppressed * is_low
+
     w = torch.ones_like(conf)
     w = w * (1 - group_a) + w_a * group_a
     w = w * mask.float()
@@ -98,10 +115,13 @@ def compute_token_weights(conf, mask, g=256, eps=1e-8):
     return w
 
 
-def compute_sample_weights(conf, mask, g=256, s_min=0.5, s_max=2.0, eps=1e-8):
+def compute_sample_weights(
+    conf, mask, g=256, s_min=0.5, s_max=2.0, eps=1e-8, running_mean_tracker=None
+):
     pad_len = g - 1
     conf_pad = F.pad(conf * mask.float(), (0, pad_len))
     mask_pad = F.pad(mask.float(), (0, pad_len))
+
     conf_windows = conf_pad.unfold(-1, g, 1)
     mask_windows = mask_pad.unfold(-1, g, 1)
 
@@ -114,22 +134,43 @@ def compute_sample_weights(conf, mask, g=256, s_min=0.5, s_max=2.0, eps=1e-8):
     min_conf = valid_window_mean.min(dim=-1).values.clamp(min=eps)
 
     s = (1.0 / min_conf).clamp(s_min, s_max)
-    s = s / s.mean().clamp(min=eps)
+
+    # FIX: Handle micro-batch size of 1 using an EMA tracker to preserve inter-sample dynamics
+    if s.numel() > 1:
+        s = s / s.mean().clamp(min=eps)
+    elif running_mean_tracker is not None:
+        s_raw = s.item()
+        running_mean_tracker["mean"] = (
+            0.95 * running_mean_tracker["mean"] + 0.05 * s_raw
+        )
+        s = s / running_mean_tracker["mean"]
+
     return s
 
 
-def bft_loss(logits, labels, g=256, s_min=0.5, s_max=2.0):
-    mask = (labels != -100).float()
+def bft_loss(logits, labels, g=256, s_min=0.5, s_max=2.0, running_mean_tracker=None):
+    # CRITICAL FIX: Manually shift tokens for causal autoregressive mapping
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    mask = (shift_labels != -100).float()
 
     with torch.no_grad():
-        conf = compute_per_token_confidence(logits.detach(), labels)
+        conf = compute_per_token_confidence(shift_logits.detach(), shift_labels)
         token_w = compute_token_weights(conf, mask, g)
-        sample_w = compute_sample_weights(conf, mask, g, s_min, s_max)
+        sample_w = compute_sample_weights(
+            conf,
+            mask,
+            g,
+            s_min,
+            s_max,
+            running_mean_tracker=running_mean_tracker,
+        )
 
-    B, T, V = logits.shape
+    B, T, V = shift_logits.shape
     ce = F.cross_entropy(
-        logits.view(B * T, V),
-        labels.clamp(min=0).view(B * T),
+        shift_logits.view(B * T, V),
+        shift_labels.clamp(min=0).view(B * T),
         reduction="none",
     ).view(B, T)
 
@@ -144,7 +185,7 @@ def bft_loss(logits, labels, g=256, s_min=0.5, s_max=2.0):
 # ─────────────────────────────────────────────
 
 
-class BFTTrainer(SFTTrainer):
+class BFTTrainer(Trainer):
     def __init__(
         self, *args, bft_window_size=256, bft_s_min=0.5, bft_s_max=2.0, **kwargs
     ):
@@ -152,6 +193,8 @@ class BFTTrainer(SFTTrainer):
         self.bft_g = bft_window_size
         self.bft_s_min = bft_s_min
         self.bft_s_max = bft_s_max
+        # EMA initialization dictionary for sequence tracking
+        self.running_s_mean = {"mean": 1.0}
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -161,26 +204,37 @@ class BFTTrainer(SFTTrainer):
         logits = outputs.logits
 
         loss = bft_loss(
-            logits, labels, g=self.bft_g, s_min=self.bft_s_min, s_max=self.bft_s_max
+            logits,
+            labels,
+            g=self.bft_g,
+            s_min=self.bft_s_min,
+            s_max=self.bft_s_max,
+            running_mean_tracker=self.running_s_mean,
         )
         return (loss, outputs) if return_outputs else loss
 
 
 # ─────────────────────────────────────────────
-#  Model + tokeniser
+#  Model + Tokenizer
 # ─────────────────────────────────────────────
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/Qwen2.5-0.5B-Instruct",
-    max_seq_length=max_seq_length,
-    load_in_4bit=False,
-    fast_inference=False,
-    max_lora_rank=lora_rank,
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.model_max_length = MAX_SEQ_LENGTH
+tokenizer.padding_side = "right"
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
 )
-tokenizer.model_max_length = max_seq_length
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=lora_rank,
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=LORA_RANK,
+    lora_alpha=LORA_ALPHA,
     target_modules=[
         "q_proj",
         "k_proj",
@@ -190,77 +244,93 @@ model = FastLanguageModel.get_peft_model(
         "up_proj",
         "down_proj",
     ],
-    lora_alpha=lora_rank * 2,
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
+    lora_dropout=0.05,
+    bias="none",
 )
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
 # ─────────────────────────────────────────────
-#  Dataset
+#  Dataset Processing
 # ─────────────────────────────────────────────
 
 df = pd.read_csv("./rare_diseases_what_is_only.csv")
 df["messages"] = df["messages"].apply(json.loads)
-tokenizer = get_chat_template(tokenizer, chat_template="qwen2.5")
 
 ds = df.copy()
 ds["text"] = None
 for i in range(len(ds)):
-    messages = ds.loc[i, "messages"]
-    ds.loc[i, "text"] = tokenizer.apply_chat_template(messages, tokenize=False)
+    ds.loc[i, "text"] = tokenizer.apply_chat_template(
+        ds.loc[i, "messages"],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 ds = Dataset.from_pandas(ds[["text"]])
 
 
-def check_lengths(example):
-    tokens = tokenizer(example["text"], truncation=True, max_length=max_seq_length)
-    return len(tokens["input_ids"])
+def tokenize(example):
+    result = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=MAX_SEQ_LENGTH,
+        padding=False,
+    )
+    result["labels"] = result["input_ids"].copy()
+    return result
 
 
-lengths = ds.map(lambda x: {"length": check_lengths(x)})
-print(f"Max token length after forced truncation: {max(lengths['length'])}")
+tokenized_ds = ds.map(tokenize, remove_columns=["text"], num_proc=4)
 
 gc.collect()
 torch.cuda.empty_cache()
 
 # ─────────────────────────────────────────────
-#  Train
+#  Execution Configuration
 # ─────────────────────────────────────────────
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
+    warmup_ratio=0.05,
+    num_train_epochs=30,
+    learning_rate=2e-4,
+    logging_steps=1,
+    optim="paged_adamw_8bit",
+    weight_decay=0.001,
+    lr_scheduler_type="cosine",
+    seed=3407,
+    bf16=True,
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+    save_strategy="steps",
+    save_steps=50,
+    save_total_limit=2,
+    report_to="none",
+    dataloader_pin_memory=False,
+    dataloader_num_workers=0,
+)
+
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer,
+    model=model,
+    padding=True,
+    pad_to_multiple_of=8,
+    label_pad_token_id=-100,
+)
 
 trainer = BFTTrainer(
     model=model,
-    tokenizer=tokenizer,
-    train_dataset=ds,
+    args=training_args,
+    train_dataset=tokenized_ds,
+    data_collator=data_collator,
     bft_window_size=256,
     bft_s_min=0.5,
     bft_s_max=2.0,
-    args=SFTConfig(
-        output_dir="./checkpoints_bft",
-        max_seq_length=max_seq_length,
-        dataset_text_field="text",
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        warmup_ratio=0.05,
-        num_train_epochs=30,
-        learning_rate=2e-4,
-        logging_steps=1,
-        optim="paged_adamw_8bit",
-        weight_decay=0.001,
-        lr_scheduler_type="cosine",
-        seed=3407,
-        packing=False,
-        gradient_checkpointing="unsloth",
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=2,
-        logging_dir="./runs_bft",
-    ),
 )
-
 
 trainer.train(resume_from_checkpoint=False)
 
-model.save_pretrained("finetuned_0.5_bft")
-tokenizer.save_pretrained("finetuned_0.5_bft")
-
-gc.collect()
-torch.cuda.empty_cache()
+model.save_pretrained(SAVE_DIR)
+tokenizer.save_pretrained(SAVE_DIR)
+print(f"Saved successfully to {SAVE_DIR}")
