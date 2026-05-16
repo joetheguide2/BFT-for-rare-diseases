@@ -46,7 +46,7 @@ MAX_SEQ_LENGTH = 4096
 LORA_RANK = 128
 LORA_ALPHA = 256
 OUTPUT_DIR = "./checkpoints_bft"
-SAVE_DIR = "./finetuned_0.5b_bft"
+SAVE_DIR = "./finetuned_0.5b_bft_correct"
 
 # BFT hyperparameters (match env-var defaults from reference)
 BFT_GROUP_SIZE = int(os.getenv("BFT_GROUP_SIZE", "256"))

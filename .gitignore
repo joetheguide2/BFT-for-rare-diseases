@@ -11,3 +11,4 @@ unsloth_compiled_cache
 # Virtual environments
 .venv
 pure_sft_small
+finetuned_*
