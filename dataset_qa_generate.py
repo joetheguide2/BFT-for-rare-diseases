@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+Generator for medical MCQ datasets.
+Reads ./what_is_1727.csv, sends the 'answer' field of each row to a local LLM (llama.cpp),
+generates up to 10 MCQs per disease, parses them safely, and saves them directly into
+mcq_dataset_rare.csv with 'question' and 'answer' columns.
+Tracks progress incrementally to allow resuming.
+"""
+
+import asyncio
+import json
+import time
+import pandas as pd
+from openai import AsyncOpenAI
+from pathlib import Path
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+CSV_FILE = "./what_is_1727.csv"  # Input CSV file
+OUTPUT_FILE = "mcq_dataset_rare_long.csv"  # Target flat MCQ dataset file
+PROGRESS_FILE = "generation_progress_2.csv"  # Intermediary progress tracker file
+BATCH_SIZE = 4  # Concurrent requests per batch
+BASE_URL = "http://localhost:8080/v1"
+API_KEY = "sk-no-key-required"
+MODEL = "gpt-3.5-turbo"  # Ignored by llama.cpp
+MAX_TOKENS = 8192  # High limit to allow up to 10 long MCQs
+TEMPERATURE = 0.0  # Deterministic generation
+
+# ------------------------------------------------------------
+# Prompt Template (Double {{ }} used to escape JSON brackets for .format())
+# ------------------------------------------------------------
+GENERATOR_PROMPT_TEMPLATE = """You are an expert medical educator. Your task is to read the provided text about a disease and generate up to 10 multiple-choice questions (MCQs) that collectively cover almost all the data provided in the text.
+
+### Instructions:
+1. Generate between 1 and 10 questions based entirely on the text complexity.
+2. Mix the difficulty: include both straightforward (easy) factual questions and more nuanced (hard) conceptual/mechanistic questions.
+3. Every question must feature exactly 4 choices (A, B, C, D).
+4. The "question" field must contain the entire question block, including the question stem and choices, formatted with line breaks (\\n).
+5. You MUST respond ONLY with a valid JSON object. Do not include any conversational filler, markdown formatting (like ```json), or extra text outside the JSON.
+6. Options must always be in the format: \\nChoices:\\nA. [Option A]\\nB. [Option B]\\nC. [Option C]\\nD. [Option D], never break this format in the question.
+7. Question should be medically accurate, difficult and within 10 questions you must cover all the data in the text.
+8. do not ask questions about UMLS codes.
+
+### Strict JSON Schema:
+{{    
+  "Questions": {{
+    "1": {{
+      "question": "Question: [Stem text here]\\nChoices:\\nA. [Option A]\\nB. [Option B]\\nC. [Option C]\\nD. [Option D]",
+      "answer": "A" 
+    }}
+  }}
+}}
+Note: The "answer" field must ONLY contain a single capital letter (A, B, C, or D).
+
+### Examples for Guidance:
+
+---
+Example 1 (Easy - Factual Extraction)
+Input Text: "Phenylketonuria (PKU) is an autosomal recessive metabolic disorder caused by a deficiency in the enzyme phenylalanine hydroxylase (PAH). This leads to toxic levels of the amino acid phenylalanine in the blood, which can cause severe intellectual disabilities if untreated."
+Output JSON:
+{{
+  "Questions": {{
+    "1": {{
+      "question": "Question: Phenylketonuria (PKU) is caused by a deficiency in which of the following enzymes?\\nChoices:\\nA. Phenylalanine hydroxylase\\nB. Tyrosine hydroxylase\\nC. Homogentisate oxidase\\nD. Branched-chain alpha-keto acid dehydrogenase",
+      "answer": "A"
+    }}
+  }}
+}}
+---
+
+---
+Example 2 (Medium - Pathophysiology Focus)
+Input Text: "Myasthenia gravis is an autoimmune neuromuscular disease characterized by muscle weakness that worsens after activity and improves with rest. It is primarily caused by autoantibodies blocking acetylcholine receptors at the neuromuscular junction."
+Output JSON:
+{{
+  "Questions": {{
+    "1": {{
+      "question": "Question: Myasthenia gravis involves an autoimmune mechanism that directly targets which of the following structures?\\nChoices:\\nA. Presynaptic voltage-gated calcium channels\\nB. Postsynaptic acetylcholine receptors\\nC. Myelin sheath of peripheral motor nerves\\nD. Dopamine receptors in the basal ganglia",
+      "answer": "B"
+    }}
+  }}
+}}
+---
+
+---
+Example 3 (Hard - Cellular Integration)
+Input Text: "Tay-Sachs disease is a fatal lysosomal storage disorder caused by a mutation in the HEXA gene, leading to a deficiency of hexosaminidase A. This causes GM2 ganglioside to accumulate in neurons, resulting in a cherry-red spot on the macula and progressive neurodegeneration."
+Output JSON:
+{{
+  "Questions": {{
+    "1": {{
+      "question": "Question: A patient presenting with progressive neurodegeneration and a cherry-red spot on the macula is diagnosed with Tay-Sachs disease. The underlying cellular toxicity is driven by the lysosomal accumulation of which specific molecule?\\nChoices:\\nA. Glucocerebroside\\nB. Sphingomyelin\\nC. GM2 ganglioside\\nD. Dermatan sulfate",
+      "answer": "C"
+    }}
+  }}
+}}
+---
+
+### Input Text to Process:
+{disease_text}
+
+### Output JSON:
+"""
+
+
+def build_prompt(disease_text):
+    """Insert the target disease definition into the generator prompt."""
+    return GENERATOR_PROMPT_TEMPLATE.format(disease_text=disease_text)
+
+
+# ------------------------------------------------------------
+# Progress and CSV Management
+# ------------------------------------------------------------
+def load_progress_dataframe():
+    """Load from intermediate progress tracker file to resume, or build fresh from input."""
+    progress_path = Path(PROGRESS_FILE)
+    if progress_path.exists():
+        print(f"📂 Resuming compilation using tracking log: {PROGRESS_FILE}")
+        df = pd.read_csv(progress_path)
+    else:
+        print(f"📂 Starting fresh from input source file: {CSV_FILE}")
+        df = pd.read_csv(CSV_FILE)
+
+    if "is_processed" not in df.columns:
+        df["is_processed"] = ""
+    return df
+
+
+def get_unprocessed_indices(df):
+    """Filter rows that have not yet successfully extracted questions."""
+    return df.index[df["is_processed"].isna() | (df["is_processed"] == "")].tolist()
+
+
+# ------------------------------------------------------------
+# Parsing & Safety Checks for Valid JSON Structure
+# ------------------------------------------------------------
+def try_parse_mcq_json(raw_text):
+    """
+    Safely finds, sanitizes, and extracts the target question map from the model's raw string.
+    Returns (parsed_dict, error_message).
+    """
+    if not raw_text:
+        return None, "Empty response from LLM"
+
+    # Find boundaries of the JSON object
+    start_brace = raw_text.find("{")
+    end_brace = raw_text.rfind("}")
+
+    if start_brace == -1 or end_brace == -1:
+        return None, "Invalid Output: No valid JSON bounding curly braces found."
+
+    json_str = raw_text[start_brace : end_brace + 1]
+
+    try:
+        data = json.loads(json_str)
+
+        # Structure Validation Safety Check
+        if "Questions" not in data:
+            return (
+                None,
+                "Invalid Schema: Top-level object missing critical 'Questions' wrapper key.",
+            )
+        if not isinstance(data["Questions"], dict):
+            return (
+                None,
+                "Invalid Schema: 'Questions' structural type must be a JSON dictionary object.",
+            )
+
+        return data, None
+    except json.JSONDecodeError as e:
+        return None, f"JSONDecodeError encountered during execution: {e}"
+
+
+# ------------------------------------------------------------
+# Async Core Requests
+# ------------------------------------------------------------
+async def single_generator_request(client, prompt, idx):
+    start = time.perf_counter()
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+        )
+        elapsed = time.perf_counter() - start
+        raw_output = response.choices[0].message.content
+        token_usage = response.usage.completion_tokens
+        print(f"  ✅ [{idx}] Generated {token_usage} tokens in {elapsed:.2f}s")
+        return raw_output, token_usage, elapsed, None
+    except Exception as e:
+        elapsed = time.perf_counter() - start
+        print(f"  ❌ [{idx}] API / Network Pipeline Error: {e}")
+        return None, 0, elapsed, str(e)
+
+
+# ------------------------------------------------------------
+# Processing Engine
+# ------------------------------------------------------------
+async def process_batch(client, batch_indices, df):
+    """Sends requests concurrently, verifies JSON structure safely, updates state, saves rows."""
+    tasks = []
+    for idx in batch_indices:
+        row = df.loc[idx]
+        # Target the requested 'answer' field containing source text
+        prompt = build_prompt(disease_text=row["answer"])
+        tasks.append(single_generator_request(client, prompt, idx))
+
+    results = await asyncio.gather(*tasks)
+    extracted_mcqs = []
+
+    for idx, (raw_output, tokens, _, request_error) in zip(batch_indices, results):
+        if request_error is not None:
+            df.at[idx, "is_processed"] = "request_error"
+            continue
+
+        parsed_data, parse_error = try_parse_mcq_json(raw_output)
+
+        if parsed_data is not None:
+            questions_block = parsed_data["Questions"]
+            valid_batch_count = 0
+
+            # Deep properties validation safety check
+            for q_id, q_body in questions_block.items():
+                if (
+                    isinstance(q_body, dict)
+                    and "question" in q_body
+                    and "answer" in q_body
+                ):
+                    extracted_mcqs.append(
+                        {
+                            "question": q_body["question"],
+                            "answer": str(q_body["answer"]).strip().upper(),
+                        }
+                    )
+                    valid_batch_count += 1
+
+            if valid_batch_count > 0:
+                print(
+                    f"  ✔ [{idx}] Parsing Successful: Extracted {valid_batch_count} valid MCQs."
+                )
+                df.at[idx, "is_processed"] = "true"
+            else:
+                print(
+                    f"  ⚠️ [{idx}] Structural Failure: JSON parsed but contained no valid question schema components."
+                )
+                df.at[idx, "is_processed"] = "schema_mismatch"
+        else:
+            df.at[idx, "is_processed"] = "parse_error"
+            print(f"  ⚠️ [{idx}] Validation Safety Triggered: {parse_error}. Skipped.")
+
+    # Incremental write of raw dataset to final output file
+    if extracted_mcqs:
+        mcq_df = pd.DataFrame(extracted_mcqs)
+        output_path = Path(OUTPUT_FILE)
+        if not output_path.exists():
+            mcq_df.to_csv(output_path, index=False)
+        else:
+            mcq_df.to_csv(output_path, mode="a", header=False, index=False)
+
+    return sum(res[1] for res in results)
+
+
+# ------------------------------------------------------------
+# Execution Entry Point
+# ------------------------------------------------------------
+async def main():
+    df = load_progress_dataframe()
+    unprocessed_indices = get_unprocessed_indices(df)
+    total_rows = len(unprocessed_indices)
+
+    if total_rows == 0:
+        print(
+            f"✅ complete! All lines in '{CSV_FILE}' have been processed into '{OUTPUT_FILE}'."
+        )
+        return
+
+    print(
+        f"📊 Dataset Stats: {len(df)} base rows loaded. {total_rows} rows remaining to process."
+    )
+    print(f"💾 MCQs are being compiled directly into -> {OUTPUT_FILE}\n")
+
+    client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
+    overall_start = time.perf_counter()
+    total_tokens_generated = 0
+
+    # Incremental execution window loop
+    for batch_num, start_idx in enumerate(range(0, total_rows, BATCH_SIZE), 1):
+        batch_indices = unprocessed_indices[start_idx : start_idx + BATCH_SIZE]
+        print(
+            f"\n🚀 Launching Batch {batch_num}: Processing Row Indices {batch_indices}"
+        )
+
+        batch_tokens = await process_batch(client, batch_indices, df)
+        total_tokens_generated += batch_tokens
+
+        # Commit current indexing position to track progress safely
+        df.to_csv(PROGRESS_FILE, index=False)
+
+    overall_elapsed = time.perf_counter() - overall_start
+    print("\n" + "=" * 60)
+    print(f"🎉 Pipeline Run Completed Successfully!")
+    print(f"⏱️ Total Execution Time: {overall_elapsed:.2f}s")
+    print(f"🔢 Generated Dataset Tokens: {total_tokens_generated}")
+    print(f"💾 Master MCQ Dataset: {OUTPUT_FILE}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,68 @@
+You are an expert medical educator. Your task is to read the provided text about a disease and generate up to 3 multiple-choice questions (MCQs) that collectively cover almost all the data provided in the text.
+
+### Instructions:
+1. Generate between 1 and 3 questions based entirely on the text complexity.
+2. Mix the difficulty: include both straightforward (easy) factual questions and more nuanced (hard) conceptual/mechanistic questions.
+3. Every question must feature exactly 4 choices (A, B, C, D).
+4. The "question" field must contain the entire question block, including the question stem and choices, formatted with line breaks (\n).
+5. You MUST respond ONLY with a valid JSON object. Do not include any conversational filler, markdown formatting (like ```json), or extra text outside the JSON.
+
+### Strict JSON Schema:
+{    
+  "Questions": {
+    "1": {
+      "question": "Question: [Stem text here]\nChoices:\nA. [Option A]\nB. [Option B]\nC. [Option C]\nD. [Option D]",
+      "answer": "A" 
+    }
+  }
+}
+Note: The "answer" field must ONLY contain a single capital letter (A, B, C, or D).
+
+### Examples for Guidance:
+
+---
+Example 1 (Easy - Factual Extraction)
+Input Text: "Phenylketonuria (PKU) is an autosomal recessive metabolic disorder caused by a deficiency in the enzyme phenylalanine hydroxylase (PAH). This leads to toxic levels of the amino acid phenylalanine in the blood, which can cause severe intellectual disabilities if untreated."
+Output JSON:
+{
+  "Questions": {
+    "1": {
+      "question": "Question: Phenylketonuria (PKU) is caused by a deficiency in which of the following enzymes?\nChoices:\nA. Phenylalanine hydroxylase\nB. Tyrosine hydroxylase\nC. Homogentisate oxidase\nD. Branched-chain alpha-keto acid dehydrogenase",
+      "answer": "A"
+    }
+  }
+}
+---
+
+---
+Example 2 (Medium - Pathophysiology Focus)
+Input Text: "Myasthenia gravis is an autoimmune neuromuscular disease characterized by muscle weakness that worsens after activity and improves with rest. It is primarily caused by autoantibodies blocking acetylcholine receptors at the neuromuscular junction."
+Output JSON:
+{
+  "Questions": {
+    "1": {
+      "question": "Question: Myasthenia gravis involves an autoimmune mechanism that directly targets which of the following structures?\nChoices:\nA. Presynaptic voltage-gated calcium channels\nB. Postsynaptic acetylcholine receptors\nC. Myelin sheath of peripheral motor nerves\nD. Dopamine receptors in the basal ganglia",
+      "answer": "B"
+    }
+  }
+}
+---
+
+---
+Example 3 (Hard - Cellular Integration)
+Input Text: "Tay-Sachs disease is a fatal lysosomal storage disorder caused by a mutation in the HEXA gene, leading to a deficiency of hexosaminidase A. This causes GM2 ganglioside to accumulate in neurons, resulting in a cherry-red spot on the macula and progressive neurodegeneration."
+Output JSON:
+{
+  "Questions": {
+    "1": {
+      "question": "Question: A patient presenting with progressive neurodegeneration and a cherry-red spot on the macula is diagnosed with Tay-Sachs disease. The underlying cellular toxicity is driven by the lysosomal accumulation of which specific molecule?\nChoices:\nA. Glucocerebroside\nB. Sphingomyelin\nC. GM2 ganglioside\nD. Dermatan sulfate",
+      "answer": "C"
+    }
+  }
+}
+---
+
+### Input Text to Process:
+[INSERT YOUR DISEASE TEXT HERE]
+
+### Output JSON:

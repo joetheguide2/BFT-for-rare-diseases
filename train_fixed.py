@@ -14,16 +14,28 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 max_seq_length = 4096
-lora_rank = 128
+lora_rank = 32
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="unsloth/Qwen2.5-0.5B-Instruct",
+    model_name="unsloth/Qwen2.5-1.5B-Instruct",
     # unsloth/gemma-3-1b-it
     max_seq_length=max_seq_length,
-    load_in_4bit=False,
+    load_in_4bit=True,
     fast_inference=False,
     max_lora_rank=lora_rank,
 )
+
+from transformers import TrainerCallback
+
+
+class SaveAdapterPerEpochCallback(TrainerCallback):
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        epoch = int(state.epoch)
+        save_path = f"./pure_sft_big_{epoch}"
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"Adapter saved to {save_path}")
+
 
 tokenizer.model_max_length = max_seq_length
 
@@ -44,7 +56,7 @@ model = FastLanguageModel.get_peft_model(
     random_state=42,
 )
 
-df = pd.read_csv("./rare_diseases_what_is_only.csv")
+df = pd.read_csv("./rare_diseases_sft_variations.csv")
 df["messages"] = df["messages"].apply(json.loads)
 
 tokenizer = get_chat_template(tokenizer, chat_template="qwen2.5")
@@ -73,15 +85,16 @@ torch.cuda.empty_cache()
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
+    callbacks=[SaveAdapterPerEpochCallback()],
     train_dataset=ds,
     args=SFTConfig(
         output_dir="./checkpoints",
         max_seq_length=max_seq_length,
         dataset_text_field="text",
         per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=8,
         warmup_ratio=0.05,
-        num_train_epochs=30,
+        num_train_epochs=3,
         learning_rate=2e-4,
         logging_steps=1,
         optim="paged_adamw_8bit",
@@ -119,8 +132,8 @@ trainer.train(resume_from_checkpoint=False)
 # plt.savefig('loss_curve.png', dpi=300, bbox_inches='tight')
 # plt.show()
 
-model.save_pretrained("pure_sft_small")
-tokenizer.save_pretrained("pure_sft_small")
+model.save_pretrained("pure_sft_big")
+tokenizer.save_pretrained("pure_sft_big")
 
 gc.collect()
 torch.cuda.empty_cache()

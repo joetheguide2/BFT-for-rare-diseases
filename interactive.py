@@ -7,12 +7,13 @@ from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 
 max_seq_length = 4096
-load_in_4bit = False
+load_in_4bit = True
 
 print("Loading model...")
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="./pure_sft_small",
-    # model_name="./finetuned_0.5b_bft",
+    # model_name="./pure_sft_small",
+    # model_name="./finetuned_0.5b_bft_correct",
+    model_name="./pure_sft_big",
     # max_seq_length=max_seq_length,
     load_in_4bit=load_in_4bit,
     fast_inference=False,
@@ -103,7 +104,7 @@ while True:
 
     outputs = model.generate(
         **inputs,
-        max_new_tokens=2048,
+        # max_new_tokens=2048,
         use_cache=True,
         temperature=0.0,
         do_sample=False,
@@ -111,8 +112,10 @@ while True:
     )
 
     # After model.generate:
-    generated_ids = outputs[0][inputs.input_ids.shape[1]:]   # new tokens only
-    assistant_response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    generated_ids = outputs[0][inputs.input_ids.shape[1] :]  # new tokens only
+    assistant_response = tokenizer.decode(
+        generated_ids, skip_special_tokens=True
+    ).strip()
 
     messages.append({"role": "assistant", "content": assistant_response})
     print(assistant_response)

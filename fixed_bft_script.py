@@ -1,13 +1,17 @@
 """
-Balanced Fine-Tuning (BFT) Training Script - Full Prompt Loss Configuration
+Balanced Fine-Tuning (BFT) Training Script - Full Prompt Loss Configuration (4-bit QLoRA)
 
 Adjustments applied:
   1. Reverted to Full Prompt Loss calculation (labels copy input_ids).
   2. Restored DataCollatorForSeq2Seq instead of completion-only masking.
   3. Preserved the token-level scaling fix to prevent the double-division bug.
+  4. Added 4-bit model quantization via BitsAndBytesConfig (QLoRA).
 """
 
 import os
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import gc
 import json
 import math
@@ -16,28 +20,46 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,  # Added for 4-bit stability
+)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,  # Added for 4-bit configuration
     DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
 
+from transformers import TrainerCallback
+
+
+class SaveAdapterPerEpochCallback(TrainerCallback):
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        epoch = int(state.epoch)
+        save_path = f"./bft_big_{epoch}"
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"Adapter saved to {save_path}")
+
+
 # ─────────────────────────────────────────────
 #  Config
 # ─────────────────────────────────────────────
 
-MODEL_NAME = "unsloth/Qwen2.5-0.5B-Instruct"
+MODEL_NAME = "unsloth/Qwen2.5-1.5B-Instruct"
 MAX_SEQ_LENGTH = 4096
-LORA_RANK = 128
-LORA_ALPHA = 256
+LORA_RANK = 32
+LORA_ALPHA = 64
 OUTPUT_DIR = "./checkpoints_bft"
-SAVE_DIR = "./finetuned_0.5b_bft_correct"
+SAVE_DIR = "./bft_big"
 
 # BFT hyperparameters
-BFT_GROUP_SIZE = int(os.getenv("BFT_GROUP_SIZE", "256"))
+BFT_GROUP_SIZE = int(os.getenv("BFT_GROUP_SIZE", "64"))
 BFT_CONF_GAMMA = float(os.getenv("BFT_CONF_GAMMA", "1.0"))
 
 # ─────────────────────────────────────────────
@@ -185,12 +207,23 @@ if tokenizer.pad_token is None:
 tokenizer.model_max_length = MAX_SEQ_LENGTH
 tokenizer.padding_side = "right"
 
+# 4-bit Quantization Config (NF4 with double quantization)
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.bfloat16,
+    quantization_config=bnb_config,
     device_map="auto",
     trust_remote_code=True,
 )
+
+# Crucial step for k-bit models when using gradient checkpointing
+model = prepare_model_for_kbit_training(model)
 
 lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
@@ -215,7 +248,7 @@ model.print_trainable_parameters()
 #  Dataset Processing
 # ─────────────────────────────────────────────
 
-df = pd.read_csv("./rare_diseases_what_is_only.csv")
+df = pd.read_csv("./rare_diseases_sft_variations.csv")
 df["messages"] = df["messages"].apply(json.loads)
 
 ds = df.copy()
@@ -252,9 +285,9 @@ torch.cuda.empty_cache()
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
+    gradient_accumulation_steps=32,
     warmup_ratio=0.05,
-    num_train_epochs=30,
+    num_train_epochs=3,
     learning_rate=2e-4,
     logging_steps=1,
     optim="paged_adamw_8bit",
@@ -285,6 +318,7 @@ trainer = BFTTrainer(
     args=training_args,
     train_dataset=tokenized_ds,
     data_collator=data_collator,
+    callbacks=[SaveAdapterPerEpochCallback()],
 )
 
 trainer.train(resume_from_checkpoint=False)
